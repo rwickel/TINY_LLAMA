@@ -228,7 +228,8 @@ class TransformerInput:
 
 @dataclass
 class LLMOutput:
-    logits: torch.Tensor   
+    logits: torch.Tensor  
+    attn_weights: Optional[torch.Tensor] = None 
 
 
 TransformerOutput = LLMOutput

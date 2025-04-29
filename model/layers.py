@@ -10,6 +10,128 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch.distributed as dist
 import os
 
+def basic_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value, attn_weight
+
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                                 is_causal=False, scale=None, enable_gqa=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes scaled dot product attention with optional masking, dropout, GQA.
+
+    Args:
+        query: Query tensor (..., L, E) where L is target sequence length.
+        key: Key tensor (..., S, E) where S is source sequence length.
+        value: Value tensor (..., S, Ev).
+        attn_mask: Optional attention mask. Can be boolean (True to keep) or float (-inf to mask).
+                   Expected shape broadcastable to (..., L, S).
+        dropout_p: Dropout probability.
+        is_causal: If True, applies a causal mask (query i cannot attend to key j > i).
+                   attn_mask should be None if is_causal is True.
+        scale: Scaling factor. Defaults to 1/sqrt(query.size(-1)).
+        enable_gqa: If True, repeats key/value heads to match query heads.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - Attention output tensor (..., L, Ev).
+            - Attention weights tensor (..., L, S).
+    """
+    # Ensure query, key, value are tensors
+    if not all(isinstance(t, torch.Tensor) for t in [query, key, value]):
+        raise TypeError("query, key, and value must be torch.Tensors")
+
+    L, S = query.size(-2), key.size(-2)
+    E = query.size(-1)
+
+    # Default scale factor
+    scale_factor = 1.0 / math.sqrt(E) if scale is None else scale
+
+    # Initialize attention bias (for masking)
+    attn_bias = torch.zeros(query.shape[:-2] + (L, S), dtype=query.dtype, device=query.device) # Match batch/head dims
+
+    # Apply causal masking if requested
+    if is_causal:
+        if attn_mask is not None:
+             raise ValueError("attn_mask must be None when is_causal=True")
+        # Create causal mask (True for allowed positions)
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        # Fill bias where mask is False (upper triangle)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    # Apply provided attention mask
+    if attn_mask is not None:
+        # Ensure mask is broadcastable to attn_bias shape
+        try:
+            broadcast_mask_shape = torch.broadcast_shapes(attn_mask.shape, attn_bias.shape)
+        except RuntimeError as e:
+            raise ValueError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to bias shape {attn_bias.shape}: {e}")
+
+        if attn_mask.dtype == torch.bool:
+            # Fill bias where mask is False
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            # Assume float mask (-inf for masked positions), add it to bias
+            attn_bias = attn_bias + attn_mask # Ensure mask is already broadcastable
+
+    # Handle Grouped Query Attention (GQA)
+    if enable_gqa:
+        num_query_heads = query.size(-3)
+        num_kv_heads = key.size(-3)
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(f"Query heads ({num_query_heads}) must be divisible by KV heads ({num_kv_heads}) for GQA")
+        n_rep = num_query_heads // num_kv_heads
+        if n_rep > 1:
+            key = key.repeat_interleave(n_rep, dim=-3)
+            value = value.repeat_interleave(n_rep, dim=-3)
+
+    # --- Attention Calculation ---
+    # 1. Calculate scores: Q @ K^T
+    attn_weight = torch.matmul(query, key.transpose(-2, -1))
+
+    # 2. Scale scores
+    attn_weight = attn_weight * scale_factor
+
+    # 3. Add masking bias
+    attn_weight = attn_weight + attn_bias # Bias already incorporates causal and attn_mask
+
+    # 4. Apply softmax
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+
+    # 5. Apply dropout (only during training)
+    # Note: torch.dropout requires `train` argument. Assume model.training state controls this.
+    # If called outside nn.Module, pass `self.training` if available, otherwise default to False.
+    is_training = isinstance(dropout_p, float) and dropout_p > 0.0 # Basic check if dropout is active
+    if is_training: # Check if dropout should be applied
+         attn_weight = F.dropout(attn_weight, p=dropout_p) # Use functional dropout
+
+    # 6. Multiply weights by Value: W @ V
+    output = torch.matmul(attn_weight, value)
+
+    return output, attn_weight
+
 def rmsnorm(x, eps):
     def _norm(y):
         return y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
@@ -177,16 +299,16 @@ class Attention(nn.Module):
             state_dict[prefix + "wq.weight"] = wq
             state_dict[prefix + "wk.weight"] = wk
             state_dict[prefix + "wv.weight"] = wv
-            print(f"Successfully split {combined_key} into wq, wk, wv weights.") # Optional logging
-
-
+            print(f"Successfully split {combined_key} into wq, wk, wv weights.") # Optional logging    
+    
+    
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]: 
         """
         Forward pass for the Attention module.
 
@@ -197,10 +319,12 @@ class Attention(nn.Module):
             mask (Optional[torch.Tensor]): Attention mask.
 
         Returns:
-            torch.Tensor: Output tensor shape (bsz, seqlen, dim).
+            Tuple[torch.Tensor, torch.Tensor]:
+                - Output tensor shape (bsz, seqlen, dim).
+                - Attention weights tensor shape (bsz, n_heads, seqlen, cache_len).
         """
         bsz, seqlen, _ = x.shape
-        assert x.requires_grad, "Input to attention must require grad"
+        
 
         # --- Debugging: Check Input Gradient ---
         # assert x.requires_grad, "Input 'x' to Attention does not require grad!"
@@ -264,25 +388,27 @@ class Attention(nn.Module):
             keys = keys.repeat_interleave(self.n_rep, dim=1)
             values = values.repeat_interleave(self.n_rep, dim=1)
 
+        # Determine if GQA is enabled based on head counts
+        enable_gqa = self.n_local_heads != self.n_local_kv_heads
+
         # Use PyTorch's optimized scaled dot-product attention
         # Ensure mask has correct shape if provided (e.g., [bsz, 1, seqlen, cache_len])
-        attn_output = F.scaled_dot_product_attention(
-            xq, keys, values, attn_mask=mask, dropout_p=0.0 # No dropout during inference/standard training
+        attn_output_heads, attn_weights = scaled_dot_product_attention(
+            query=xq,
+            key=keys,
+            value=values,
+            attn_mask=mask, # Pass the prepared float mask from LLM
+            dropout_p=0.0,  # Set dropout probability (e.g., self.config.dropout if available)
+            is_causal=False, # Let the provided mask handle causality/caching
+            enable_gqa=enable_gqa # Enable GQA repetition inside the function if needed
         )
 
-        # --- Debugging: Check Attention Output Gradient ---
-        assert attn_output.requires_grad, "scaled_dot_product_attention lost gradient!"
-
-        # Reshape output back to (bsz, seqlen, dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        attn_output = attn_output_heads.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         # Final linear projection
-        output = self.wo(attn_output)
+        output = self.wo(attn_output)        
 
-        # --- Debugging: Check Final Output Gradient ---
-        assert output.requires_grad, "Final wo projection lost gradient!"
-
-        return output
+        return output, attn_weights
 
 
 class FeedForward(nn.Module):

@@ -2,154 +2,36 @@ import os
 import sys
 import torch
 import torch.nn.functional as F
+import math # Needed for sqrt in scaled_dot_product_attention if used directly
+import json # Needed for loading params.json
+from pathlib import Path # For handling paths
+from typing import Tuple, Optional, List, Generator # Added Generator
 
 # --- Assumed Custom Module Imports ---
 # Make sure these paths are correct relative to where you run the script,
 # or that the 'model' and 'trainer' directories are in your PYTHONPATH.
 try:
-    from model.args import ModelArgs # Assuming your model needs this
-    from model.model import LLM     # Your custom Transformer model class
-    from model.datatypes import TransformerInput # Input type for your model's forward pass
-    from model.tokenizer import Tokenizer # Your custom Tokenizer class
+    # Assuming your model needs ModelArgs for instantiation
+    from model.args import ModelArgs
+    # Your custom Transformer model class
+    from model.model import LLM
+    # Input type for your model's forward pass
+    from model.datatypes import TransformerInput, TransformerOutput
+    # Your custom Tokenizer class
+    from model.tokenizer import Tokenizer
+    # Import the generation function and helper from generation.py
+    # *** Corrected: generate_text is the function to import/use ***
+    from generation import generate_text, sample_top_p # Import sample_top_p
     # You might need TrainingConfig if ModelArgs depends on it, but likely not for inference
     # from trainer.config import TrainingConfig
 except ImportError as e:
     print(f"Error importing custom modules: {e}")
-    print("Ensure 'model', 'trainer' directories are accessible.")
+    print("Ensure 'model', 'trainer', and 'generation.py' are accessible.")
     exit()
 
-# --- Helper Function: sample_top_p (Copied from your generation code) ---
-def sample_top_p(probs, p):
-    """
-    Perform top-p (nucleus) sampling on a probability distribution.
-    Args:
-        probs (torch.Tensor): Probability distribution tensor.
-        p (float): Probability threshold for top-p sampling.
-    Returns:
-        torch.Tensor: Sampled token indices.
-    """
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    # Ensure no division by zero if all probabilities become zero after masking
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True).clamp(min=1e-8))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
+# --- Helper Function: sample_top_p is now imported from generation.py ---
 
-# --- Core Generation Function ---
-@torch.inference_mode()
-def generate_text(
-    model: LLM,
-    tokenizer: Tokenizer,
-    prompt: str,
-    max_new_tokens: int = 100,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    device: str = "cuda" # Or torch.device object
-):
-    """
-    Generates text token by token based on a prompt using the provided model and tokenizer.
-
-    Args:
-        model: The loaded LLM model instance.
-        tokenizer: The loaded Tokenizer instance.
-        prompt: The input string prompt.
-        max_new_tokens: The maximum number of new tokens to generate.
-        temperature: Sampling temperature. 0 means greedy decoding.
-        top_p: Nucleus sampling probability.
-        device: The device to run generation on ('cuda' or 'cpu').
-
-    Yields:
-        str: The decoded text of each generated token.
-    """
-    model.eval() # Ensure model is in evaluation mode
-    model.to(device)
-
-    # --- Prepare Input ---
-    # Encode the prompt. Assuming bos=True is needed for your model.
-    # Adjust eos=False/True based on how your model was trained.
-    prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
-    prompt_tokens_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
-    bsz, prompt_len = prompt_tokens_tensor.shape
-    assert bsz == 1, "This function only supports batch size 1 for interactive use"
-
-    # --- Setup Generation ---
-    if not hasattr(model, 'args') or not hasattr(model.args, 'max_seq_len'):
-         raise AttributeError("Model object must have an 'args' attribute with 'max_seq_len' defined.")
-    max_seq_len = model.args.max_seq_len
-    total_len = min(max_seq_len, prompt_len + max_new_tokens)
-
-    if prompt_len >= total_len:
-        print(f"Warning: Prompt length ({prompt_len}) is already >= max sequence length ({max_seq_len}) or max_new_tokens limit. No new tokens will be generated.")
-        # Optionally yield the prompt back or do nothing
-        # decoded_prompt = tokenizer.decode(prompt_tokens)
-        # yield decoded_prompt
-        return
-
-    # Use the tokenizer's pad_id. Handle potential missing attribute.
-    pad_id = getattr(tokenizer, 'pad_id', -1) # Use -1 or another value if pad_id isn't standard
-    if pad_id == -1:
-        print("Warning: Tokenizer does not have 'pad_id'. Using -1 as placeholder.")
-
-    # Prepare buffer for all tokens (prompt + generated)
-    tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
-    tokens[0, :prompt_len] = prompt_tokens_tensor[0] # Fill with prompt tokens
-
-    # Get stop tokens from the tokenizer, if available
-    stop_tokens = []
-    if hasattr(tokenizer, 'stop_tokens'):
-       stop_tokens = torch.tensor(tokenizer.stop_tokens, device=device)
-
-    # --- Generation Loop (Token by Token) ---
-    prev_pos = 0 # For KV cache handling in the model's forward pass
-    for cur_pos in range(prompt_len, total_len):
-        # Prepare input for the model's forward pass (incremental decoding)
-        # The model internally uses the KV cache based on tokens_position
-        xformer_input = TransformerInput(
-            tokens=tokens[:, prev_pos:cur_pos], # Input tokens for this step
-            tokens_position=prev_pos,          # Starting position for KV cache indexing
-            image_embedding=None               # Assuming no image input for text generation
-        )
-
-        # Get logits from the model
-        try:
-            xformer_output = model.forward(xformer_input)
-            logits = xformer_output.logits[:, -1, :] # Get logits for the very last token position
-        except Exception as e:
-            print(f"\nError during model forward pass at position {cur_pos}: {e}")
-            print(f"Input tokens shape: {xformer_input.tokens.shape}")
-            print(f"Tokens position: {xformer_input.tokens_position}")
-            break # Stop generation on error
-
-        # Sample the next token
-        if temperature > 0:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            next_token = sample_top_p(probs, top_p) # Shape: [1, 1]
-        else:
-            # Greedy decoding
-            next_token = torch.argmax(logits, dim=-1, keepdim=True) # Shape: [1, 1]
-
-        next_token = next_token.reshape(-1) # Reshape to [1] for easier handling
-
-        # Add the sampled token to our buffer
-        tokens[0, cur_pos] = next_token
-
-        # Check if the generated token is a stop token
-        # Ensure stop_tokens is a tensor and not empty before checking
-        if len(stop_tokens) > 0 and torch.isin(next_token, stop_tokens):
-            # Optional: Decode and yield the stop token itself if needed
-            # decoded_token = tokenizer.decode(next_token.tolist())
-            # yield decoded_token + " [EOS]" # Indicate stop
-            break # Stop generation
-
-        # Decode the single generated token and yield it for streaming output
-        decoded_token = tokenizer.decode(next_token.tolist())
-        yield decoded_token
-
-        # Update prev_pos for the next iteration's KV cache window
-        prev_pos = cur_pos
+# --- Core Generation Function is now imported from generation.py ---
 
 # --- Main Interactive Testing Script ---
 if __name__ == '__main__':
@@ -157,48 +39,63 @@ if __name__ == '__main__':
     # *** USER: MUST SET THESE VALUES ***
     TOKENIZER_NAME = "cl100k_base" # Or the specific name/path used during training
     CHECKPOINT_DIR = 'my_transformer_checkpoints' # Directory where checkpoints are saved
-    # Find the latest checkpoint or specify one manually
-    # Example: Find the latest checkpoint based on epoch/step
-    try:
-        checkpoints = [f for f in os.listdir(CHECKPOINT_DIR) if f.endswith('.pt')]
-        if not checkpoints:
-            raise FileNotFoundError("No .pt checkpoint files found in directory.")
-        # Sort checkpoints (example: assumes format like checkpoint_epoch_XXX_step_YYY_loss_ZZZ.pt)
-        checkpoints.sort(key=lambda x: int(x.split('_')[2]), reverse=True) # Sort by epoch desc
-        LATEST_CHECKPOINT_FILENAME = checkpoints[0]
-        CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, LATEST_CHECKPOINT_FILENAME)
-        print(f"Using latest checkpoint: {CHECKPOINT_PATH}")
-    except (FileNotFoundError, IndexError, ValueError, TypeError) as e:
-         print(f"Error finding latest checkpoint in '{CHECKPOINT_DIR}': {e}")
-         # *** USER: Manually set the path if auto-detection fails ***
-         CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, 'checkpoint_epoch_437_step_206880_loss_2.4620.pt') # << SET MANUALLY IF NEEDED
-         print(f"Falling back to manual checkpoint path: {CHECKPOINT_PATH}")
-         if not os.path.exists(CHECKPOINT_PATH):
-              print(f"Error: Manual checkpoint path does not exist: {CHECKPOINT_PATH}")
-              exit()
 
+    # --- Model arguments will be loaded from params.json ---
 
-    # Model arguments (MUST match the arguments used during training for the loaded checkpoint)
-    # *** USER: MUST SET THESE VALUES TO MATCH TRAINING ***
-    model_args = ModelArgs(
-        dim=512,
-        n_layers=8,
-        n_heads=8,
-        n_kv_heads=2, # Make sure this matches training
-        # head_dim will likely be calculated inside ModelArgs or LLM based on dim and n_heads
-        # batch_size is not needed for inference args usually
-        # vocab_size will be set after loading tokenizer
-        max_seq_len=512, # Must match training
-        rope_theta=10000.0,
-        norm_eps=1e-5,
-        ffn_dim_multiplier=2, # Make sure this matches training
-        # device will be set below
-    )
     # Generation parameters
     MAX_NEW_TOKENS = 150
     TEMPERATURE = 0.7
     TOP_P = 0.9
     # --- End Configuration ---
+
+    # --- Checkpoint Finding ---
+    LATEST_CHECKPOINT_FILENAME = None
+    CHECKPOINT_PATH = None
+    PARAMS_PATH = None
+    try:
+        checkpoint_dir_path = Path(CHECKPOINT_DIR)
+        if not checkpoint_dir_path.is_dir():
+             raise FileNotFoundError(f"Checkpoint directory not found: {CHECKPOINT_DIR}")
+
+        # Find params.json first
+        PARAMS_PATH = checkpoint_dir_path / "params.json"
+        if not PARAMS_PATH.is_file():
+             raise FileNotFoundError(f"params.json not found in checkpoint directory: {CHECKPOINT_DIR}")
+
+        # Find checkpoint files
+        checkpoints = sorted([f for f in checkpoint_dir_path.glob('checkpoint_*.pt')]) # Use glob and sort
+        if not checkpoints:
+            raise FileNotFoundError("No .pt checkpoint files starting with 'checkpoint_' found in directory.")
+
+        # Sort checkpoints (example: assumes format like checkpoint_epoch_XXX_step_YYY_loss_ZZZ.pt)
+        def get_sort_key(filepath: Path):
+            filename = filepath.name
+            try:
+                 # Extract epoch and step, handle potential errors gracefully
+                 epoch_str = filename.split('_')[2]
+                 step_str = filename.split('_')[4]
+                 epoch = int(epoch_str)
+                 step = int(step_str)
+                 return epoch, step
+            except (IndexError, ValueError):
+                 # If filename format is unexpected, return a value that sorts it last
+                 print(f"Warning: Could not parse epoch/step from filename: {filename}. Placing it last.")
+                 return (-1, -1) # Sort unparseable names last
+
+        checkpoints.sort(key=get_sort_key, reverse=True) # Sort by epoch, then step (descending)
+
+        LATEST_CHECKPOINT_FILENAME = checkpoints[0].name
+        CHECKPOINT_PATH = checkpoints[0] # Use the Path object directly
+        print(f"Found params.json: {PARAMS_PATH}")
+        print(f"Using latest checkpoint: {CHECKPOINT_PATH}")
+
+    except FileNotFoundError as e:
+        print(f"Error finding required files in '{CHECKPOINT_DIR}': {e}")
+        exit()
+    except Exception as e:
+        print(f"Error during checkpoint/params finding in '{CHECKPOINT_DIR}': {e}")
+        exit()
+
 
     # --- Setup ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -208,48 +105,126 @@ if __name__ == '__main__':
     try:
         print(f"Loading tokenizer: {TOKENIZER_NAME}")
         tokenizer = Tokenizer(base_model_name=TOKENIZER_NAME)
-        # Set vocab_size in model_args based on loaded tokenizer
-        model_args.vocab_size = tokenizer.model.n_vocab
-        print(f"Tokenizer loaded. Vocab size: {model_args.vocab_size}")
-        # Add device to model args AFTER setting vocab size
-        model_args.device = device
+        # Ensure tokenizer has n_vocab attribute after loading
+        if not hasattr(tokenizer, 'model') or not hasattr(tokenizer.model, 'n_vocab'):
+             raise AttributeError("Tokenizer object or its 'model' attribute missing 'n_vocab'.")
+        print(f"Tokenizer loaded. Vocab size: {tokenizer.model.n_vocab}")
     except Exception as e:
         print(f"Error loading tokenizer '{TOKENIZER_NAME}': {e}")
         exit()
 
+    # --- Load Model Arguments from params.json ---
+    try:
+        print(f"Loading model arguments from: {PARAMS_PATH}")
+        with open(PARAMS_PATH, "r") as f:
+            params = json.load(f)
+            print("Successfully loaded params.json.")
+
+        # Instantiate ModelArgs using loaded params
+        # Ensure required args like max_seq_len are present or handled
+        # max_seq_len might be defined during training config, not necessarily saved in params.json
+        # If it's crucial for ModelArgs init, ensure it's in params or handle default/override
+        if 'max_seq_len' not in params:
+             print("Warning: 'max_seq_len' not found in params.json. Ensure ModelArgs handles this or set a default.")
+             # Example: Set a default if ModelArgs requires it
+             # params['max_seq_len'] = 512 # Or get from a config object if available
+
+        model_args: ModelArgs = ModelArgs(**params)
+
+        # Set vocab_size in model_args AFTER loading from json
+        # This is usually runtime/environment specific, not architecture specific
+        model_args.vocab_size = tokenizer.model.n_vocab
+
+        # *** REMOVED line causing the error ***
+        # model_args.device = device # Cannot set ClassVar on instance
+
+        print("Model arguments configured:")
+        # Pretty print the args
+        try:
+            # Use model_dump if available (Pydantic v2+) else __dict__
+            if hasattr(model_args, 'model_dump'):
+                 print(json.dumps(model_args.model_dump(), indent=2))
+            elif hasattr(model_args, '__dict__'):
+                 # Convert potentially complex objects (like device) to str for printing
+                 # Exclude the 'device' ClassVar if it exists in __dict__
+                 printable_args = {k: str(v) if isinstance(v, torch.device) else v
+                                   for k, v in model_args.__dict__.items() if k != 'device'}
+                 print(json.dumps(printable_args, indent=2))
+            else: # Fallback for objects without __dict__ (less common)
+                 print(vars(model_args))
+
+        except TypeError as e: # Handle potential non-serializable types if ModelArgs is complex
+            print(f"Could not serialize all model args for printing: {e}")
+            print(vars(model_args)) # Print raw vars as fallback
+
+
+    except FileNotFoundError:
+        print(f"Error: params.json not found at {PARAMS_PATH}")
+        exit()
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from {PARAMS_PATH}")
+        exit()
+    except TypeError as e:
+        print(f"Error initializing ModelArgs with parameters from params.json: {e}")
+        print("Ensure params.json content matches ModelArgs fields.")
+        exit()
+    except Exception as e:
+        print(f"An unexpected error occurred loading model args: {e}")
+        exit()
+
+
     # Instantiate Model
     print("Instantiating model...")
+    # Pass the configured model_args object
     model = LLM(model_args)
     model.to(device) # Move model structure to device before loading state_dict
 
     # Load Checkpoint
     try:
-        print(f"Loading checkpoint: {CHECKPOINT_PATH}")
+        print(f"Loading checkpoint state dictionary: {CHECKPOINT_PATH}")
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device) # Load directly to the target device
 
         # Handle potential DataParallel or DistributedDataParallel wrappers
-        state_dict = checkpoint['model_state_dict']
+        state_dict = checkpoint.get('model_state_dict', None)
+        if state_dict is None:
+             # Try loading older format if 'model_state_dict' is missing
+             print("Warning: 'model_state_dict' key not found. Attempting to load the entire checkpoint as state_dict.")
+             state_dict = checkpoint
+
         # Remove `module.` prefix if saved with DataParallel/DDP
         unwrapped_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                unwrapped_state_dict[k[len('module.'):]] = v
-            else:
-                unwrapped_state_dict[k] = v
+        needs_unwrapping = any(k.startswith('module.') for k in state_dict.keys())
+        if needs_unwrapping:
+            print("Unwrapping 'module.' prefix from state_dict keys...")
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    unwrapped_state_dict[k[len('module.'):]] = v
+                else:
+                    # If some keys have prefix and others don't, it might be an issue
+                    unwrapped_state_dict[k] = v
+        else:
+            unwrapped_state_dict = state_dict
 
-        model.load_state_dict(unwrapped_state_dict)
-        print("Model state dictionary loaded successfully.")
+        # Load the state dict (use strict=True for better error checking during inference setup)
+        load_result = model.load_state_dict(unwrapped_state_dict, strict=True)
+        print(f"Model state dictionary load result: {load_result}")
 
         # Optional: Load optimizer/epoch/step if needed for other purposes, but not for generation
-        # epoch = checkpoint.get('epoch', 0)
-        # step = checkpoint.get('global_step', 0)
-        # print(f"Checkpoint from Epoch: {epoch}, Step: {step}")
+        epoch = checkpoint.get('epoch', 'N/A')
+        step = checkpoint.get('global_step', 'N/A')
+        print(f"Checkpoint info - Epoch: {epoch}, Step: {step}")
 
     except FileNotFoundError:
         print(f"Error: Checkpoint file not found at {CHECKPOINT_PATH}")
         exit()
+    except KeyError as e:
+         print(f"Error: Checkpoint missing required key: {e}")
+         exit()
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
+        # Print detailed traceback for debugging loading errors
+        import traceback
+        traceback.print_exc()
         exit()
 
     # --- Interactive Loop ---
@@ -266,23 +241,25 @@ if __name__ == '__main__':
             if not prompt.strip():
                 continue
 
-            print("Model: ", end="", flush=True) # Print "Model: " prefix
-
-            # Generate text using the function, streaming output
-            full_response = ""
-            for token_text in generate_text(
+            # Generate text using the imported function
+            # *** Corrected function name from 'generate' to 'generate_text' ***
+            full_response, attn_weights = generate_text(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
                 max_new_tokens=MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
-                device=device
-            ):
-                print(token_text, end="", flush=True) # Print each token without newline
-                full_response += token_text
+                device=device,
+                return_attn_weights=False # Set True only if you want to process weights
+            )
+            # The generate_text function now handles the streaming print internally
 
-            print() # Add a newline after the full response is generated
+            # If attn_weights were requested and returned, you can process them here:
+            if attn_weights is not None:
+                 print(f"\nReceived attention weights tensor with shape: {attn_weights.shape}")
+                 # Add code here to visualize or analyze attn_weights
+
             print("-" * 50) # Separator
 
         except KeyboardInterrupt:

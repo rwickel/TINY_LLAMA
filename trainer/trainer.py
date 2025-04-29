@@ -1,3 +1,4 @@
+# trainer.py
 import os
 import re
 import time
@@ -362,7 +363,7 @@ class Trainer:
 
                     except Exception as e:
                         logger.error(f"\nError during model forward or loss calculation at global step {self.global_step}. Error: {e}", exc_info=True)
-                        print(f"\nError during model forward or loss calculation at global step {self.global_step}. Error: {e}", exc_info=True)
+                        print(f"\nError during model forward or loss calculation at global step {self.global_step}. Error: {e}")
                         # Optional debugging prints:
                         # logger.info(f"Input IDs shape: {input_ids.shape}")
                         # logger.info(f"Targets shape: {targets.shape}")

@@ -1,10 +1,11 @@
+# generation.py
 # Assume necessary imports are present
 import os
 import sys
 import time
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Generator, Callable # Added Generator, Callable
+from typing import Any, Dict,Union, List, Optional, Tuple, Generator, Callable # Added Generator, Callable
 
 import torch
 import torch.nn.functional as F
@@ -219,6 +220,7 @@ class TinyLlama:
         # Instantiate and return the TinyLlama wrapper class
         return TinyLlama(model, tokenizer, model_args)
 
+    
 
     @torch.inference_mode()
     def generate(
@@ -622,6 +624,179 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
     return next_token.squeeze(-1) # Return shape [bsz]
 
+@torch.inference_mode()
+def generate_text(
+    model: LLM,
+    tokenizer: Tokenizer,
+    prompt: str,
+    max_new_tokens: int = 100,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    device: Union[str, torch.device] = "cuda", # Accept string or device object
+    return_attn_weights: bool = False # Flag to request weights (will increase memory)
+) -> Tuple[str, Optional[torch.Tensor]]:
+    """
+    Generates text token by token for a SINGLE prompt using the provided model and tokenizer.
+
+    Args:
+        model: The loaded LLM model instance.
+        tokenizer: The loaded Tokenizer instance.
+        prompt: The input string prompt.
+        max_new_tokens: The maximum number of new tokens to generate.
+        temperature: Sampling temperature. Lower values are more deterministic.
+                     Set to 0 for greedy decoding.
+        top_p: Nucleus sampling probability. 1.0 means no top-p filtering.
+        device: The device to run generation on ('cuda' or 'cpu' or torch.device).
+        return_attn_weights: If True, request attention weights from the model.
+
+    Returns:
+        Tuple[str, Optional[torch.Tensor]]:
+            - The full generated text string (prompt + completion).
+            - The collected attention weights tensor (if requested), otherwise None.
+              Shape: (n_layers, 1, n_heads, generated_seq_len, context_len)
+              Note: Weights are collected step-by-step and might be complex to interpret/visualize directly.
+                    Returning weights from the last step as an example.
+    """
+    model.eval() # Ensure model is in evaluation mode (disables dropout, etc.)
+    # Ensure device is a torch.device object
+    if isinstance(device, str):
+        device = torch.device(device)
+    model.to(device)
+
+    # --- Prepare Input ---
+    # Encode the prompt. Adjust bos/eos based on how your model was trained.
+    prompt_tokens = tokenizer.encode(prompt, bos=True, eos=False)
+    prompt_tokens_tensor = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+    bsz, prompt_len = prompt_tokens_tensor.shape
+    assert bsz == 1, "This standalone generate_text function only supports batch size 1"
+
+    # --- Setup Generation ---
+    if not hasattr(model, 'args') or not hasattr(model.args, 'max_seq_len'):
+        raise AttributeError("Model object must have an 'args' attribute with 'max_seq_len' defined.")
+    max_seq_len = model.args.max_seq_len
+    total_len = min(max_seq_len, prompt_len + max_new_tokens)
+
+    if prompt_len >= total_len:
+        print(f"\nWarning: Prompt length ({prompt_len}) is >= max sequence length ({max_seq_len}) or max_new_tokens limit ({max_new_tokens}). No new tokens generated.")
+        return prompt, None # Return original prompt and no weights
+
+    # Use the tokenizer's pad_id if available, otherwise handle appropriately
+    pad_id = getattr(tokenizer, 'pad_id', -1) # Using -1 as a placeholder if not found
+    if pad_id == -1 or pad_id is None:
+        pad_id = -1 # Ensure it's a valid integer for torch.full
+        print("\nWarning: Tokenizer does not have 'pad_id' or it's None. Using -1 as placeholder.")
+
+    # Prepare buffer for all tokens (prompt + generated)
+    tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
+    tokens[0, :prompt_len] = prompt_tokens_tensor[0] # Fill with prompt tokens
+
+    # Get stop tokens from the tokenizer, if available
+    stop_tokens = []
+    if hasattr(tokenizer, 'stop_tokens') and tokenizer.stop_tokens:
+       try:
+           stop_tokens = torch.tensor(tokenizer.stop_tokens, device=device, dtype=torch.long)
+       except (TypeError, ValueError) as e:
+           print(f"\nWarning: Could not convert tokenizer.stop_tokens to tensor: {e}. Ignoring stop tokens.")
+           stop_tokens = []
+
+
+    # --- Generation Loop (Token by Token) ---
+    prev_pos = 0 # For KV cache handling in the model's forward pass
+    all_generated_tokens = [] # Store generated token IDs
+    collected_weights_list = [] # Store weights from each step if requested
+
+    # print("Model: ", end="", flush=True) # Moved printing to the calling script (test.py)
+
+    output_text = "" # Accumulate generated text
+
+    for cur_pos in range(prompt_len, total_len):
+        # Prepare input for the model's forward pass (incremental decoding)
+        # The model internally uses the KV cache based on tokens_position
+        xformer_input = TransformerInput(
+            tokens=tokens[:, prev_pos:cur_pos], # Input tokens for this step (only the new one)
+            tokens_position=prev_pos,           # Starting position for KV cache indexing
+            image_embedding=None                # Assuming no image input
+        )
+
+        # Get model output (logits and potentially weights)
+        try:
+            # Request weights only if needed for this step
+            xformer_output = model.forward(
+                xformer_input,
+                return_attn_weights=return_attn_weights
+            )
+            logits = xformer_output.logits[:, -1, :] # Get logits for the very last token position
+            step_attn_weights = xformer_output.attn_weights # Shape: [layers, bsz, heads, 1, K] or None
+
+            if return_attn_weights and step_attn_weights is not None:
+                 # Store weights (consider memory implications)
+                 # Shape: (n_layers, 1, n_heads, 1, prev_pos+1)
+                 collected_weights_list.append(step_attn_weights.cpu()) # Move to CPU to save GPU memory
+
+        except Exception as e:
+            print(f"\nError during model forward pass at position {cur_pos}: {e}")
+            print(f"Input tokens shape: {xformer_input.tokens.shape}")
+            print(f"Tokens position: {xformer_input.tokens_position}")
+            break # Stop generation on error
+
+        # Sample the next token
+        if temperature > 0:
+            # Apply temperature scaling
+            probs = torch.softmax(logits / temperature, dim=-1)
+            # Apply top-p (nucleus) sampling
+            next_token = sample_top_p(probs, top_p) # Shape: [1] (since bsz=1)
+        else:
+            # Greedy decoding (temperature == 0)
+            next_token = torch.argmax(logits, dim=-1) # Shape: [1]
+
+        next_token = next_token.reshape(-1) # Ensure shape is [1]
+        next_token_item = next_token.item()
+        all_generated_tokens.append(next_token_item) # Store generated token ID
+
+        # Add the sampled token to our buffer for the next iteration
+        tokens[0, cur_pos] = next_token
+
+        # Check if the generated token is a stop token
+        if len(stop_tokens) > 0 and torch.isin(next_token, stop_tokens):
+            # print(" [EOS]", end="", flush=True) # Moved printing to the calling script
+            break # Stop generation
+
+        # Decode the single generated token and yield it for streaming output
+        try:
+            # Need to handle potential list vs tensor input for decode
+            decoded_token = tokenizer.decode([next_token_item])
+            # Yield or print the token - modified to return full text at the end
+            # print(decoded_token, end="", flush=True) # Moved printing to the calling script
+            output_text += decoded_token # Append to the full output string
+        except Exception as e:
+            print(f"\nError decoding token {next_token_item}: {e}")
+            # Continue generating even if decoding fails for one token
+
+        # Update prev_pos for the next iteration's KV cache window
+        prev_pos = cur_pos
+
+    # print() # Moved printing to the calling script
+
+    # --- Post-processing ---
+    # Construct the full generated sequence text (prompt + generated tokens)
+    full_generated_sequence_text = prompt + output_text
+
+    # Process collected weights if requested
+    final_attn_weights = None
+    if return_attn_weights and collected_weights_list:
+        # This simple stacking might not be ideal for visualization tools like BertViz,
+        # which often expect weights from a single forward pass over the full sequence.
+        # Stacking weights collected token-by-token results in varying context lengths.
+        # For BertViz, consider running a separate forward pass on the *entire* generated sequence.
+        try:
+             # Example: Just return the weights from the last step for simplicity
+             final_attn_weights = collected_weights_list[-1] if collected_weights_list else None
+             print("\nNote: Returning attention weights from the *last* generation step.")
+             # A more complex stacking/processing would be needed to combine weights across steps.
+        except Exception as e:
+            print(f"\nWarning: Could not process collected attention weights: {e}")
+
+    return full_generated_sequence_text, final_attn_weights
 
 # --- Example Usage ---
 if __name__ == '__main__':
